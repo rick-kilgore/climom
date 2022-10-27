@@ -1,0 +1,8 @@
+/target
+*.od
+*.pcm
+Cargo.lock
+sys
+code.rs
+code
+coreaudio-rs
