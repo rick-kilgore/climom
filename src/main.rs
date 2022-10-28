@@ -3,7 +3,7 @@ use coreaudio::audio_unit::audio_format::LinearPcmFlags;
 use coreaudio::audio_unit::macos_helpers::{
     audio_unit_from_device_id, find_matching_physical_format, get_audio_device_ids,
     get_audio_device_supports_scope, get_device_name, get_supported_physical_stream_formats,
-    set_device_physical_stream_format,
+    set_device_physical_stream_format, AliveListener, RateListener,
 };
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::{Element, SampleFormat, Scope, StreamFormat};
@@ -28,6 +28,51 @@ const SINE880_MODE: &str = "sine880";
 const BUFSIZE: usize = 1000 * 1000 * 10 * std::mem::size_of::<f32>();
 static mut audio_buf: Vec<f32> = Vec::new();
 
+fn main() -> Result<(), Box<dyn Error>> {
+
+    let mut mom_mode: &str = mom_mode_from_cli_args(env::args().collect());
+
+    // setup exchange buffer
+    unsafe {
+        audio_buf.reserve(BUFSIZE);
+    }
+
+    stream_audio(mom_mode);
+    write_to_file(mom_mode);
+
+    Ok(())
+}
+
+fn write_to_file(mom_mode: &str) -> Result<(), Box<dyn Error>> {
+  println!("writing to file {}", mom_mode);
+  let mut file: File = File::create(mom_mode)?;
+  unsafe {
+      let ptr = audio_buf.as_ptr();
+      let bytes: &[u8] = std::slice::from_raw_parts(
+          audio_buf.as_ptr() as *const u8,
+          audio_buf.len() * std::mem::size_of::<f32>(),
+      );
+      file.write_all(bytes)?;
+  }
+  println!("done.");
+}
+
+fn mom_mode_from_cli_args(cli_args: &Vec<String>) -> &'static str {
+    let mut mom_mode: &str = CAP_MODE;
+    if cli_args.len() > 1 {
+        if cli_args[1].starts_with("cap") {
+            mom_mode = CAP_MODE;
+        } else if cli_args[1].starts_with("play") {
+            mom_mode = PLAY_MODE;
+        } else if cli_args[1].contains("440") {
+            mom_mode = SINE440_MODE;
+        } else if cli_args[1].contains("880") {
+            mom_mode = SINE880_MODE;
+        }
+    }
+    return mom_mode;
+}
+
 fn find_matching_dev(
     name_substr: &str,
     scope: Scope,
@@ -48,46 +93,6 @@ fn find_matching_dev(
         }
     }
     return Err("DAD device not found");
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut mom_mode: &str = CAP_MODE;
-    let args: Vec<String> = env::args().collect();
-    if args.len() > 1 {
-        if args[1].starts_with("cap") {
-            mom_mode = CAP_MODE;
-        } else if args[1].starts_with("play") {
-            mom_mode = PLAY_MODE;
-        } else if args[1].contains("440") {
-            mom_mode = SINE440_MODE;
-        } else if args[1].contains("880") {
-            mom_mode = SINE880_MODE;
-        }
-    }
-    unsafe {
-        audio_buf.reserve(BUFSIZE);
-    }
-    stream_audio(mom_mode);
-    let fname = format!(
-        "{}.pcm",
-        if mom_mode == SINE880_MODE {
-            "a880"
-        } else {
-            "a440"
-        }
-    );
-    println!("writing to file {}", &fname);
-    let mut file: File = File::create(&fname)?;
-    unsafe {
-        let ptr = audio_buf.as_ptr();
-        let bytes: &[u8] = std::slice::from_raw_parts(
-            audio_buf.as_ptr() as *const u8,
-            audio_buf.len() * std::mem::size_of::<f32>(),
-        );
-        file.write_all(bytes)?;
-    }
-    println!("done.");
-    Ok(())
 }
 
 fn print_supported_formats(devid: AudioDeviceID) -> Result<(), Box<dyn Error>> {
@@ -152,6 +157,14 @@ fn set_audiounit_format(
   Ok(())
 }
 
+fn setup_au_listeners(devid: AudioDeviceID) -> Result<(RateListener, AliveListener), Box<dyn Error>> {
+  let mut rate_listener = RateListener::new(devid, None);
+  rate_listener.register()?;
+  let mut alive_listener = AliveListener::new(devid);
+  alive_listener.register()?;
+  Ok((rate_listener, alive_listener))
+}
+
 fn stream_audio(mom_mode: &str) -> Result<(), Box<dyn Error>> {
 	let sample_rate: f64 = 48_000.0;
 	let sample_format: SampleFormat = SampleFormat::F32;
@@ -166,12 +179,7 @@ fn stream_audio(mom_mode: &str) -> Result<(), Box<dyn Error>> {
     set_physical_device_format(devid, sample_rate, sample_format, n_channels)?;
     set_audiounit_format(&mut audio_unit, sample_rate, sample_format, n_channels)?;
 
-
-    let mut rate_listener, alive_listener = setup_au_listeners(
-    let mut rate_listener = RateListener::new(audio_unit_id, None);
-    rate_listener.register()?;
-    let mut alive_listener = AliveListener::new(audio_unit_id);
-    alive_listener.register()?;
+    let (mut rate_listener, mut alive_listener) = setup_au_listeners(devid)?;
 
     type Args = render_callback::Args<data::Interleaved<f32>>;
     audio_unit.set_input_callback(move |args| -> Result<(), ()> {
@@ -191,8 +199,8 @@ fn stream_audio(mom_mode: &str) -> Result<(), Box<dyn Error>> {
     for _ in 0..2 {
         std::thread::sleep(std::time::Duration::from_millis(1000));
         // print all sample change events
-        // println!("rate events: {:?}", rate_listener.copy_values());
-        // println!("alive state: {}", alive_listener.is_alive());
+        println!("rate events: {:?}", rate_listener.copy_values());
+        println!("alive state: {}", alive_listener.is_alive());
     }
     Ok(())
 }
