@@ -1,6 +1,4 @@
-use core_foundation_sys::string::{
-    CFStringCreateWithCString, CFStringGetCString, CFStringGetCStringPtr, CFStringRef,
-};
+use coreaudio::audio_unit::AudioUnit;
 use coreaudio::audio_unit::audio_format::LinearPcmFlags;
 use coreaudio::audio_unit::macos_helpers::{
     audio_unit_from_device_id, find_matching_physical_format, get_audio_device_ids,
@@ -10,23 +8,18 @@ use coreaudio::audio_unit::macos_helpers::{
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::{Element, SampleFormat, Scope, StreamFormat};
 use coreaudio::sys::{
-    kAudioDevicePropertyDeviceNameCFString, kAudioDevicePropertyScopeOutput, kAudioHardwareNoError,
-    kAudioObjectPropertyElementMain, kAudioUnitProperty_StreamFormat, kCFAllocatorDefault,
-    kCFStringEncodingUTF8, AudioDeviceID, AudioObjectGetPropertyData, AudioObjectPropertyAddress,
-    AudioObjectSetPropertyData,
+    kAudioUnitProperty_StreamFormat,
+    AudioDeviceID,
 };
+mod au_helpers;
+use crate::au_helpers::*;
 
 use std::env;
 use std::error::Error;
-use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::prelude::*;
-use std::os::raw::{c_char, c_void};
-use std::ptr::null;
 
-use coreaudio::error::Error as AudioError;
 
-const MOM_PROP_ID: &str = "momm";
 const CAP_MODE: &str = "capture";
 const PLAY_MODE: &str = "playout";
 const SINE440_MODE: &str = "sine440";
@@ -55,18 +48,6 @@ fn find_matching_dev(
         }
     }
     return Err("DAD device not found");
-}
-
-fn idFromCharsLikeAppleDoes(chars: &str) -> u32 {
-    assert!(chars.chars().count() == 4);
-    let mut id: u32 = 0;
-    let mut mult: u32 = 256u32.pow(3);
-    for ch in chars.chars() {
-        let uch = ch as u32;
-        id += (uch * mult);
-        mult /= 256;
-    }
-    return id;
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -109,20 +90,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn identify_to_dad(devid: AudioDeviceID) -> Result<(), Box<dyn Error>> {
-    let mom_property_id = idFromCharsLikeAppleDoes(MOM_PROP_ID);
-    println!("requesting Mom property id {}", mom_property_id);
-    let mut momprop = get_mom_prop(devid, mom_property_id)?;
-    let status = set_mom_prop(devid, mom_property_id, &CString::new(mom_mode)?)?;
-    momprop = get_mom_prop(devid, mom_property_id)?;
-    println!("devid = {}  momprop = {}", devid, momprop);
-    Ok(())
-}
-
 fn print_supported_formats(devid: AudioDeviceID) -> Result<(), Box<dyn Error>> {
     // print supported formats, disabled for now since it often crashes.
     println!("All supported formats");
-    let formats = macos_helpers::get_supported_physical_stream_formats(devid)?;
+    let formats = get_supported_physical_stream_formats(devid)?;
     for fmt in formats {
         println!("supported type={}\n{:?}", type_of(&fmt), &fmt);
     }
@@ -153,7 +124,7 @@ fn set_physical_device_format(
 }
 
 fn set_audiounit_format(
-    devid: AudioDeviceID,
+    audio_unit: &mut AudioUnit,
     sample_rate: f64,
     sample_format: SampleFormat,
     n_channels: u32,
@@ -187,14 +158,20 @@ fn stream_audio(mom_mode: &str) -> Result<(), Box<dyn Error>> {
 	let n_channels: u32 = 2;
     let (devid, name) = find_matching_dev("Meta Audio Debug", Scope::Input).unwrap();
     let mut audio_unit = audio_unit_from_device_id(devid, true).unwrap();
-    // std::thread::sleep(std::time::Duration::from_millis(1000));
 
-    identify_to_dad(devid)?;
+    identify_me_to_dad(devid, mom_mode)?;
 
     // print_supported_formats(devid)?;
 
     set_physical_device_format(devid, sample_rate, sample_format, n_channels)?;
-    set_audiounit_format(devid, sample_rate, sample_format, n_channels)?;
+    set_audiounit_format(&mut audio_unit, sample_rate, sample_format, n_channels)?;
+
+
+    let mut rate_listener, alive_listener = setup_au_listeners(
+    let mut rate_listener = RateListener::new(audio_unit_id, None);
+    rate_listener.register()?;
+    let mut alive_listener = AliveListener::new(audio_unit_id);
+    alive_listener.register()?;
 
     type Args = render_callback::Args<data::Interleaved<f32>>;
     audio_unit.set_input_callback(move |args| -> Result<(), ()> {
@@ -237,100 +214,6 @@ fn write_data(num_frames: usize, data: data::Interleaved<f32>) -> Result<usize, 
         audio_buf.extend_from_slice(&data.buffer[0..num_frames * 2]);
     }
     Ok(num_frames)
-}
-
-pub fn get_mom_prop(
-    device_id: AudioDeviceID,
-    mom_property_id: u32,
-) -> Result<String, coreaudio::error::Error> {
-    let property_address = AudioObjectPropertyAddress {
-        mSelector: mom_property_id,
-        mScope: kAudioDevicePropertyScopeOutput,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-
-    macro_rules! try_status_or_return {
-        ($status:expr) => {
-            if $status != kAudioHardwareNoError as i32 {
-                return Err(AudioError::Unknown($status));
-            }
-        };
-    }
-
-    let device_name: CFStringRef = null();
-    let data_size = std::mem::size_of::<CFStringRef>();
-    let c_str = unsafe {
-        let c_string: *const c_char = null();
-        let status = AudioObjectGetPropertyData(
-            device_id,
-            &property_address as *const _,
-            0,
-            null(),
-            &data_size as *const _ as *mut _,
-            &device_name as *const _ as *mut _,
-        );
-        try_status_or_return!(status);
-        let mut buf: [i8; 255] = [0; 255];
-        let result = CFStringGetCString(
-            device_name,
-            buf.as_mut_ptr(),
-            buf.len() as _,
-            kCFStringEncodingUTF8,
-        );
-        if result == 0 {
-            return Err(AudioError::Unknown(result as i32));
-        }
-        let name: &CStr = CStr::from_ptr(buf.as_ptr());
-        return Ok(name.to_str().unwrap().to_owned());
-        CStr::from_ptr(c_string as *mut _)
-    };
-    Ok(c_str.to_str().unwrap().to_owned())
-}
-
-pub fn set_mom_prop(
-    device_id: AudioDeviceID,
-    mom_property_id: u32,
-    mom_mode: &CString,
-) -> Result<bool, coreaudio::error::Error> {
-    let property_address = AudioObjectPropertyAddress {
-        mSelector: mom_property_id,
-        mScope: kAudioDevicePropertyScopeOutput,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-
-    macro_rules! try_status_or_return {
-        ($status:expr) => {
-            if $status != kAudioHardwareNoError as i32 {
-                return Err(AudioError::Unknown($status));
-            }
-        };
-    }
-
-    let c_str = unsafe {
-        println!("calling CFStringCreateWithCString()");
-        let device_name = CFStringCreateWithCString(
-            kCFAllocatorDefault as *const c_void,
-            mom_mode.as_ptr() as *const c_char,
-            kCFStringEncodingUTF8,
-        );
-        let data_size = std::mem::size_of::<CFStringRef>();
-        println!(
-            "calling AudioObjectSetPropertyData() with size {}",
-            data_size
-        );
-        let status = AudioObjectSetPropertyData(
-            device_id,
-            &property_address as *const _,
-            0,
-            null(),
-            data_size as u32,
-            &device_name as *const _ as *mut _,
-        );
-        try_status_or_return!(status);
-        println!("DONE calling AudioObjectSetPropertyData()");
-        return Ok(true);
-    };
-    Ok(true)
 }
 
 fn type_of<T>(_: &T) -> &str {
